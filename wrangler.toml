@@ -1,0 +1,15 @@
+name = "echo-document-delivery"
+main = "src/index.ts"
+compatibility_date = "2024-12-01"
+
+[vars]
+ENVIRONMENT = "production"
+
+[[r2_buckets]]
+binding = "R2"
+bucket_name = "echo-prime-media"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "echo-document-delivery"
+database_id = "91eb9b7f-0198-44f9-835e-91334b059b3c"
