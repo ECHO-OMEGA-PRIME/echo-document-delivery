@@ -74,6 +74,30 @@ app.use('*', cors({
   allowMethods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
 }));
 
+// ─── Rate Limiting (in-memory, 120 req/min per IP on writes) ─────────
+const rlMap = new Map<string, { count: number; window: number }>();
+app.use('*', async (c, next) => {
+  if (c.req.method === 'POST' || c.req.method === 'PUT' || c.req.method === 'DELETE') {
+    const ip = c.req.header('CF-Connecting-IP') || 'unknown';
+    const window = Math.floor(Date.now() / 60000);
+    const entry = rlMap.get(ip);
+    if (entry && entry.window === window) {
+      if (entry.count >= 120) return c.json({ error: 'Rate limit exceeded', retry_after: 60 }, 429);
+      entry.count++;
+    } else {
+      rlMap.set(ip, { count: 1, window });
+    }
+    // GC old entries every ~100 requests
+    if (rlMap.size > 500) {
+      for (const [k, v] of rlMap) { if (v.window < window - 1) rlMap.delete(k); }
+    }
+  }
+  return next();
+});
+
+// ─── Root ────────────────────────────────────────────────
+app.get('/', (c) => c.json({ service: 'echo-document-delivery', version: '1.0.0', status: 'operational' }));
+
 // ─── Health ──────────────────────────────────────────────
 app.get('/health', (c) => c.json({ status: 'healthy', service: 'echo-document-delivery', version: '1.0.0', timestamp: new Date().toISOString() }));
 
