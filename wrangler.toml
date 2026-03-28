@@ -13,3 +13,7 @@ bucket_name = "echo-prime-media"
 binding = "DB"
 database_name = "echo-document-delivery"
 database_id = "91eb9b7f-0198-44f9-835e-91334b059b3c"
+
+[[analytics_engine_datasets]]
+binding = "ANALYTICS"
+dataset = "echo_metrics"
