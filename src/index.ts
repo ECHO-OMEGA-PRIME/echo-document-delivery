@@ -11,6 +11,7 @@
 
 import { Hono } from 'hono';
 import { cors } from 'hono/cors';
+import { PDFDocument, rgb, StandardFonts } from 'pdf-lib';
 
 interface Env {
   DB: D1Database;
@@ -215,9 +216,25 @@ app.post('/documents/generate', async (c) => {
   // Create document record
   const docId = uid();
   const viewToken = crypto.randomUUID();
+  // Store full document data as metadata so PDF endpoint can reconstruct
+  const storedMetadata = JSON.stringify({
+    items: b.items,
+    subtotal: b.subtotal || 0,
+    tax_rate: b.tax_rate || 0,
+    tax_amount: b.tax_amount || 0,
+    amount_paid: b.amount_paid || 0,
+    due_date: b.due_date || '',
+    service_date: b.service_date || '',
+    job_title: b.job_title || '',
+    service_type: b.service_type || '',
+    notes: b.notes || '',
+    payment_terms: b.payment_terms || '',
+    scope_items: b.scope_items || [],
+    ...(b.metadata || {}),
+  });
   await c.env.DB.prepare(
     `INSERT INTO documents (id, tenant_id, doc_type, doc_number, source_id, customer_name, customer_email, customer_phone, customer_address, r2_key, view_token, total, currency, metadata, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))`
-  ).bind(docId, tenant.id, b.doc_type.toUpperCase(), b.doc_number, b.source_id || '', b.customer_name, b.customer_email || '', b.customer_phone || '', b.customer_address || '', r2Key, viewToken, b.total || 0, b.currency || 'USD', b.metadata ? JSON.stringify(b.metadata) : null).run();
+  ).bind(docId, tenant.id, b.doc_type.toUpperCase(), b.doc_number, b.source_id || '', b.customer_name, b.customer_email || '', b.customer_phone || '', b.customer_address || '', r2Key, viewToken, b.total || 0, b.currency || 'USD', storedMetadata).run();
 
   const workerUrl = new URL(c.req.url).origin;
   const viewUrl = `${workerUrl}/view/${viewToken}`;
@@ -525,6 +542,255 @@ async function hashIP(ip: string): Promise<string> {
   const hash = await crypto.subtle.digest('SHA-256', data);
   return Array.from(new Uint8Array(hash)).map(b => b.toString(16).padStart(2, '0')).join('').slice(0, 16);
 }
+
+// ═══════════════════════════════════════════════════════════
+// ─── SERVER-SIDE PDF GENERATION (pdf-lib) ────────────────
+// ═══════════════════════════════════════════════════════════
+
+async function generateDocumentPDF(opts: {
+  type: string; docNumber: string; date: string; dueDate?: string; serviceDate?: string;
+  customerName: string; customerEmail?: string; customerPhone?: string; customerAddress?: string;
+  jobTitle?: string; serviceType?: string;
+  items: DocItem[]; subtotal: number; taxRate: number; taxAmount: number; total: number;
+  amountPaid?: number; notes?: string; paymentTerms?: string;
+  company: CompanyConfig;
+}): Promise<Uint8Array> {
+  const doc = await PDFDocument.create();
+  const page = doc.addPage([612, 792]); // Letter size
+  const helvetica = await doc.embedFont(StandardFonts.Helvetica);
+  const helveticaBold = await doc.embedFont(StandardFonts.HelveticaBold);
+  const co = opts.company;
+  const typeLabel = opts.type.replace(/_/g, ' ');
+  let y = 740;
+  const margin = 50;
+  const w = 512;
+
+  // ── Company Header ──
+  page.drawRectangle({ x: 0, y: 742, width: 612, height: 50, color: rgb(0.05, 0.16, 0.28) });
+  page.drawText(co.name.toUpperCase(), { x: margin, y: 755, size: 18, font: helveticaBold, color: rgb(1, 1, 1) });
+  if (co.tagline) page.drawText(co.tagline, { x: margin, y: 744, size: 8, font: helvetica, color: rgb(0.8, 0.8, 0.8) });
+
+  // Right-aligned doc type badge
+  const badgeText = typeLabel;
+  const badgeW = helveticaBold.widthOfTextAtSize(badgeText, 14);
+  page.drawText(badgeText, { x: 612 - margin - badgeW, y: 755, size: 14, font: helveticaBold, color: rgb(1, 0.84, 0) });
+
+  y = 720;
+
+  // ── Doc Info Row ──
+  const drawLabel = (x: number, yp: number, label: string, value: string) => {
+    page.drawText(label, { x, y: yp, size: 7, font: helvetica, color: rgb(0.5, 0.5, 0.5) });
+    page.drawText(value || '--', { x, y: yp - 11, size: 10, font: helveticaBold, color: rgb(0.1, 0.1, 0.1) });
+  };
+
+  drawLabel(margin, y, 'DOCUMENT #', opts.docNumber);
+  drawLabel(margin + 130, y, 'DATE', opts.date);
+  if (opts.dueDate) drawLabel(margin + 260, y, 'DUE DATE', opts.dueDate);
+  if (opts.serviceDate) drawLabel(margin + 390, y, 'SERVICE DATE', opts.serviceDate);
+  y -= 40;
+
+  // ── Customer Info ──
+  page.drawRectangle({ x: margin, y: y - 5, width: w, height: 1, color: rgb(0.85, 0.85, 0.85) });
+  y -= 20;
+  drawLabel(margin, y, 'BILL TO', opts.customerName);
+  if (opts.customerAddress) { page.drawText(opts.customerAddress, { x: margin, y: y - 22, size: 9, font: helvetica, color: rgb(0.3, 0.3, 0.3) }); }
+  if (opts.customerEmail) drawLabel(margin + 250, y, 'EMAIL', opts.customerEmail);
+  if (opts.customerPhone) drawLabel(margin + 250, y - 20, 'PHONE', opts.customerPhone);
+  y -= 55;
+
+  // ── Job Info (if estimate/work order) ──
+  if (opts.jobTitle || opts.serviceType) {
+    page.drawRectangle({ x: margin, y: y - 5, width: w, height: 1, color: rgb(0.85, 0.85, 0.85) });
+    y -= 20;
+    if (opts.jobTitle) drawLabel(margin, y, 'PROJECT', opts.jobTitle);
+    if (opts.serviceType) drawLabel(margin + 250, y, 'SERVICE TYPE', opts.serviceType);
+    y -= 30;
+  }
+
+  // ── Line Items Table ──
+  page.drawRectangle({ x: margin, y: y - 2, width: w, height: 20, color: rgb(0.05, 0.16, 0.28) });
+  const cols = [margin + 5, margin + 300, margin + 380, margin + 450];
+  const colHeaders = ['Description', 'Qty', 'Rate', 'Amount'];
+  colHeaders.forEach((h, i) => {
+    page.drawText(h, { x: cols[i], y: y + 4, size: 8, font: helveticaBold, color: rgb(1, 1, 1) });
+  });
+  y -= 18;
+
+  for (const item of opts.items) {
+    if (y < 120) { /* Would need pagination for very long items — skip for now */ break; }
+    y -= 18;
+    const desc = (item.description || '').slice(0, 60);
+    page.drawText(desc, { x: cols[0], y, size: 9, font: helvetica, color: rgb(0.2, 0.2, 0.2) });
+    page.drawText(String(item.qty || 1), { x: cols[1], y, size: 9, font: helvetica, color: rgb(0.2, 0.2, 0.2) });
+    page.drawText('$' + (item.rate || 0).toFixed(2), { x: cols[2], y, size: 9, font: helvetica, color: rgb(0.2, 0.2, 0.2) });
+    page.drawText('$' + (item.amount || 0).toFixed(2), { x: cols[3], y, size: 9, font: helveticaBold, color: rgb(0.1, 0.1, 0.1) });
+    page.drawRectangle({ x: margin, y: y - 4, width: w, height: 0.5, color: rgb(0.9, 0.9, 0.9) });
+  }
+
+  // ── Totals ──
+  y -= 25;
+  page.drawRectangle({ x: margin + 300, y: y - 2, width: w - 300, height: 1, color: rgb(0.7, 0.7, 0.7) });
+  y -= 14;
+  const drawTotal = (label: string, value: string, bold = false) => {
+    const f = bold ? helveticaBold : helvetica;
+    const sz = bold ? 11 : 9;
+    page.drawText(label, { x: margin + 350, y, size: sz, font: f, color: rgb(0.3, 0.3, 0.3) });
+    page.drawText(value, { x: margin + 450, y, size: sz, font: f, color: rgb(0.1, 0.1, 0.1) });
+    y -= (bold ? 18 : 15);
+  };
+  drawTotal('Subtotal', '$' + opts.subtotal.toFixed(2));
+  if (opts.taxAmount > 0) drawTotal('Tax (' + (opts.taxRate || 0) + '%)', '$' + opts.taxAmount.toFixed(2));
+  drawTotal('TOTAL', '$' + opts.total.toFixed(2), true);
+  if ((opts.amountPaid || 0) > 0) {
+    drawTotal('Paid', '$' + (opts.amountPaid || 0).toFixed(2));
+    drawTotal('Balance Due', '$' + (opts.total - (opts.amountPaid || 0)).toFixed(2), true);
+  }
+
+  // ── Notes ──
+  if (opts.notes) {
+    y -= 10;
+    page.drawText('Notes', { x: margin, y, size: 8, font: helveticaBold, color: rgb(0.4, 0.4, 0.4) });
+    y -= 12;
+    const noteLines = opts.notes.split('\n').slice(0, 4);
+    for (const line of noteLines) {
+      page.drawText(line.slice(0, 90), { x: margin, y, size: 8, font: helvetica, color: rgb(0.4, 0.4, 0.4) });
+      y -= 11;
+    }
+  }
+
+  // ── Payment Terms ──
+  if (opts.paymentTerms) {
+    y -= 5;
+    page.drawText('Payment Terms: ' + opts.paymentTerms, { x: margin, y, size: 8, font: helvetica, color: rgb(0.5, 0.5, 0.5) });
+  }
+
+  // ── Footer ──
+  page.drawRectangle({ x: 0, y: 0, width: 612, height: 35, color: rgb(0.96, 0.96, 0.97) });
+  const footerText = [co.name, co.city, co.phone, co.email].filter(Boolean).join(' • ');
+  page.drawText(footerText, { x: margin, y: 14, size: 7, font: helvetica, color: rgb(0.6, 0.6, 0.6) });
+
+  return doc.save();
+}
+
+// ═══════════════════════════════════════════════════════════
+// ─── EMAIL WITH PDF ATTACHMENT (one-click send) ──────────
+// ═══════════════════════════════════════════════════════════
+
+app.post('/deliver/email-pdf', async (c) => {
+  const tenantKey = c.req.header('X-Tenant-Key');
+  const tenant = await getTenant(c.env.DB, tenantKey);
+  const denied = requireTenant(c, tenant);
+  if (denied) return denied;
+
+  const b = await c.req.json();
+  const { document_id, to, subject, message } = b;
+  if (!document_id) return c.json({ error: 'document_id required' }, 400);
+
+  // Load document record
+  const docRec = await c.env.DB.prepare('SELECT * FROM documents WHERE id = ? AND tenant_id = ?').bind(document_id, tenant.id).first() as any;
+  if (!docRec) return c.json({ error: 'Document not found' }, 404);
+
+  // Get customer email — use provided 'to' or fall back to document's customer_email
+  const recipientEmail = to || docRec.customer_email;
+  if (!recipientEmail) return c.json({ error: 'No recipient email. Provide "to" or ensure customer has email on file.' }, 400);
+
+  const company: CompanyConfig = {
+    name: tenant.company_name, phone: tenant.company_phone, email: tenant.company_email,
+    tagline: tenant.company_tagline, website: tenant.company_website, city: tenant.company_city,
+    primaryColor: tenant.primary_color, accentColor: tenant.accent_color, logoUrl: tenant.logo_url,
+  };
+
+  // Parse document metadata to rebuild items for PDF
+  let items: DocItem[] = [{ description: docRec.doc_type + ' ' + docRec.doc_number, qty: 1, rate: docRec.total || 0, amount: docRec.total || 0 }];
+  let metadata: any = {};
+  try { metadata = docRec.metadata ? JSON.parse(docRec.metadata) : {}; } catch {}
+  if (metadata.items?.length) items = metadata.items;
+
+  // Generate PDF
+  const pdfBytes = await generateDocumentPDF({
+    type: docRec.doc_type, docNumber: docRec.doc_number, date: docRec.created_at?.split('T')[0] || new Date().toISOString().split('T')[0],
+    dueDate: metadata.due_date, serviceDate: metadata.service_date,
+    customerName: docRec.customer_name || 'Customer', customerEmail: docRec.customer_email,
+    customerPhone: docRec.customer_phone, customerAddress: docRec.customer_address,
+    jobTitle: metadata.job_title, serviceType: metadata.service_type,
+    items, subtotal: metadata.subtotal || docRec.total || 0, taxRate: metadata.tax_rate || 0,
+    taxAmount: metadata.tax_amount || 0, total: docRec.total || 0,
+    amountPaid: metadata.amount_paid, notes: metadata.notes, paymentTerms: metadata.payment_terms,
+    company,
+  });
+
+  // Store PDF in R2
+  const safeName = (docRec.customer_name || 'customer').replace(/[^a-zA-Z0-9]/g, '_').slice(0, 30);
+  const pdfKey = `${tenant.slug}/pdf/${docRec.doc_type.toLowerCase()}/${docRec.doc_number}_${safeName}.pdf`;
+  await c.env.R2.put(pdfKey, pdfBytes, { httpMetadata: { contentType: 'application/pdf' } });
+
+  // Convert to base64 for Resend attachment (chunked to avoid stack overflow)
+  let pdfBase64 = '';
+  const chunk = 8192;
+  for (let i = 0; i < pdfBytes.length; i += chunk) {
+    pdfBase64 += String.fromCharCode(...pdfBytes.subarray(i, i + chunk));
+  }
+  pdfBase64 = btoa(pdfBase64);
+
+  // Check Resend key
+  const resendKey = tenant.resend_api_key;
+  if (!resendKey) return c.json({ ok: false, error: 'Email provider not configured. Set resend_api_key in tenant settings.' }, 503);
+
+  // Build email
+  const esc = (s: string) => (s || '').replace(/[<>&"']/g, ch => ({ '<': '&lt;', '>': '&gt;', '&': '&amp;', '"': '&quot;', "'": '&#39;' }[ch] || ch));
+  const typeLabel = docRec.doc_type.replace(/_/g, ' ');
+  const emailSubject = subject || `${typeLabel} ${docRec.doc_number} from ${company.name}`;
+  const viewUrl = `${new URL(c.req.url).origin}/view/${docRec.view_token}`;
+  const filename = `${typeLabel.replace(/\s/g, '_')}_${docRec.doc_number}_${safeName}.pdf`;
+
+  const emailHtml = `<!DOCTYPE html><html><body style="font-family:'Open Sans',Arial,sans-serif;max-width:600px;margin:0 auto;background:#f8f9fa;padding:20px">
+<div style="background:${company.primaryColor};color:#fff;padding:20px 30px;border-radius:10px 10px 0 0">
+  <h1 style="margin:0;font-size:22px">${esc(company.name)}</h1>
+  <p style="margin:4px 0 0;font-size:12px;color:rgba(255,255,255,.7)">${esc(company.tagline)}</p>
+</div>
+<div style="background:#fff;padding:30px;border:1px solid #e5e7eb;border-top:none">
+  <p style="font-size:14px;color:#374151;line-height:1.8">${message ? esc(message) : `Please find your ${typeLabel.toLowerCase()} attached to this email.`}</p>
+  <div style="background:#f3f4f6;padding:16px;border-radius:8px;margin:16px 0">
+    <table style="width:100%;font-size:13px;color:#374151">
+      <tr><td style="padding:4px 0;font-weight:600">Document:</td><td>${esc(typeLabel)} ${esc(docRec.doc_number)}</td></tr>
+      <tr><td style="padding:4px 0;font-weight:600">Amount:</td><td style="font-weight:700;color:#1E40AF">$${(docRec.total || 0).toFixed(2)}</td></tr>
+      <tr><td style="padding:4px 0;font-weight:600">Customer:</td><td>${esc(docRec.customer_name)}</td></tr>
+    </table>
+  </div>
+  <p style="font-size:12px;color:#6B7280">The PDF is attached to this email. You can also <a href="${esc(viewUrl)}" style="color:${company.primaryColor}">view it online</a>.</p>
+</div>
+<div style="padding:16px 30px;text-align:center;font-size:11px;color:#9CA3AF">
+  ${esc(company.name)} | ${esc(company.city)} | ${esc(company.phone)} | ${esc(company.email)}
+</div>
+</body></html>`;
+
+  const fromAddr = tenant.email_from || `${company.name} <noreply@${company.website || 'echo-op.com'}>`;
+  const deliveryId = uid();
+
+  try {
+    const resp = await fetch('https://api.resend.com/emails', {
+      method: 'POST',
+      headers: { 'Authorization': `Bearer ${resendKey}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        from: fromAddr, to: [recipientEmail], subject: emailSubject, html: emailHtml,
+        attachments: [{ filename, content: pdfBase64 }],
+      }),
+    });
+    const data = await resp.json() as any;
+
+    await c.env.DB.prepare(
+      "INSERT INTO deliveries (id, document_id, tenant_id, channel, status, delivered_to, delivered_at, error_message, provider_id, created_at) VALUES (?, ?, ?, 'email', ?, ?, datetime('now'), ?, ?, datetime('now'))"
+    ).bind(deliveryId, document_id, tenant.id, resp.ok ? 'sent' : 'failed', recipientEmail, resp.ok ? null : (data.message || 'Unknown'), data.id || '').run();
+
+    if (resp.ok) return c.json({ ok: true, delivery_id: deliveryId, email_id: data.id, pdf_r2_key: pdfKey, sent_to: recipientEmail });
+    return c.json({ ok: false, error: data.message || 'Email send failed', status: resp.status }, 502);
+  } catch (e: any) {
+    await c.env.DB.prepare(
+      "INSERT INTO deliveries (id, document_id, tenant_id, channel, status, delivered_to, error_message, created_at) VALUES (?, ?, ?, 'email', 'failed', ?, ?, datetime('now'))"
+    ).bind(deliveryId, document_id, tenant.id, recipientEmail, e.message).run();
+    return c.json({ ok: false, error: e.message }, 500);
+  }
+});
 
 // ═══════════════════════════════════════════════════════════
 // ─── UNIVERSAL DOCUMENT HTML BUILDER ─────────────────────

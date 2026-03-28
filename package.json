@@ -7,10 +7,11 @@
     "deploy": "wrangler deploy"
   },
   "dependencies": {
-    "hono": "^4.6.0"
+    "hono": "^4.6.0",
+    "pdf-lib": "^1.17.1"
   },
   "devDependencies": {
-    "wrangler": "^3.114.0",
-    "@cloudflare/workers-types": "^4.20250109.0"
+    "@cloudflare/workers-types": "^4.20250109.0",
+    "wrangler": "^3.114.0"
   }
 }
