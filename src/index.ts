@@ -13,6 +13,8 @@ import { Hono } from 'hono';
 import { cors } from 'hono/cors';
 import { PDFDocument, rgb, StandardFonts } from 'pdf-lib';
 
+const ALLOWED_ORIGINS = ['https://echo-ept.com','https://www.echo-ept.com','https://echo-op.com','https://profinishusa.com','https://bgat.echo-op.com'];
+
 interface Env {
   DB: D1Database;
   R2: R2Bucket;
@@ -70,7 +72,7 @@ const app = new Hono<{ Bindings: Env }>();
 const uid = () => crypto.randomUUID().replace(/-/g, '').slice(0, 16);
 
 app.use('*', cors({
-  origin: '*',
+  origin: (o) => ALLOWED_ORIGINS.includes(o) ? o : ALLOWED_ORIGINS[0],
   allowMethods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
 }));
 // Security headers middleware
