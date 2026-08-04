@@ -124,9 +124,23 @@ function requireTenant(c: any, tenant: any) {
   return null;
 }
 
-function requireAdmin(c: any) {
+async function constantTimeEqual(presented: string | null | undefined, expected: string | null | undefined): Promise<boolean> {
+  if (!presented || !expected) return false;
+  const encoder = new TextEncoder();
+  const [presentedHash, expectedHash] = await Promise.all([
+    crypto.subtle.digest('SHA-256', encoder.encode(presented)),
+    crypto.subtle.digest('SHA-256', encoder.encode(expected)),
+  ]);
+  const left = new Uint8Array(presentedHash);
+  const right = new Uint8Array(expectedHash);
+  let mismatch = 0;
+  for (let i = 0; i < left.length; i++) mismatch |= left[i] ^ right[i];
+  return mismatch === 0;
+}
+
+async function requireAdmin(c: any) {
   const key = c.req.header('X-Admin-Key') || c.req.header('X-Echo-API-Key');
-  if (!key || key !== c.env.ADMIN_API_KEY) return c.json({ error: 'Admin access required' }, 401);
+  if (!(await constantTimeEqual(key, c.env.ADMIN_API_KEY))) return c.json({ error: 'Admin access required' }, 401);
   return null;
 }
 
@@ -135,7 +149,7 @@ function requireAdmin(c: any) {
 // ═══════════════════════════════════════════════════════════
 
 app.post('/tenants', async (c) => {
-  const denied = requireAdmin(c);
+  const denied = await requireAdmin(c);
   if (denied) return denied;
   const b = await c.req.json();
   if (!b.name || !b.slug || !b.company_name) return c.json({ error: 'name, slug, company_name required' }, 400);
@@ -156,14 +170,14 @@ app.post('/tenants', async (c) => {
 });
 
 app.get('/tenants', async (c) => {
-  const denied = requireAdmin(c);
+  const denied = await requireAdmin(c);
   if (denied) return denied;
   const rows = await c.env.DB.prepare('SELECT id, name, slug, company_name, company_email, created_at FROM tenants ORDER BY created_at DESC').all();
   return c.json(rows.results);
 });
 
 app.get('/tenants/:id', async (c) => {
-  const denied = requireAdmin(c);
+  const denied = await requireAdmin(c);
   if (denied) return denied;
   const t = await c.env.DB.prepare('SELECT * FROM tenants WHERE id = ?').bind(c.req.param('id')).first();
   if (!t) return c.json({ error: 'Tenant not found' }, 404);
@@ -171,7 +185,7 @@ app.get('/tenants/:id', async (c) => {
 });
 
 app.put('/tenants/:id', async (c) => {
-  const denied = requireAdmin(c);
+  const denied = await requireAdmin(c);
   if (denied) return denied;
   const b = await c.req.json();
   const id = c.req.param('id');
